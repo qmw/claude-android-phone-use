@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Phone MCP</string>
+    <string name="accessibility_description">Runs an MCP server on this phone so an AI assistant (e.g. Claude) you authorize with a token can view the screen, tap, swipe, type and launch apps. Anyone with the token who can reach the port has full control of the device.</string>
+</resources>
