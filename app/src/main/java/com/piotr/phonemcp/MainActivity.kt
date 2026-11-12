@@ -15,7 +15,9 @@ import android.os.Bundle
 import android.provider.Settings
 import android.util.TypedValue
 import android.view.View
+import android.text.InputType
 import android.widget.Button
+import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
@@ -29,6 +31,8 @@ class MainActivity : Activity() {
     private lateinit var token: TextView
     private lateinit var stopButton: Button
     private lateinit var notificationStatus: TextView
+    private lateinit var unlockStatus: TextView
+    private lateinit var unlockOffButton: Button
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -62,6 +66,14 @@ class MainActivity : Activity() {
         notificationStatus = label(root, "", 15f)
         button(root, "Grant notification access") {
             startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+        }
+
+        heading(root, "Remote unlock")
+        unlockStatus = label(root, "", 15f)
+        button(root, "Set unlock PIN or password") { showSetSecretDialog() }
+        unlockOffButton = button(root, "Turn off remote unlock") {
+            UnlockSecret.clear(this)
+            refresh()
         }
 
         heading(root, "Endpoint")
@@ -119,11 +131,55 @@ class MainActivity : Activity() {
         notificationStatus.text = if (granted) "Claude can read notifications while the phone is unlocked"
         else "Off: Claude can't read notifications"
 
+        unlockStatus.text = when {
+            !UnlockSecret.isSet(this) -> "Off: Claude can't unlock this phone"
+            UnlockSecret.isPaused(this) -> "Paused after a failed attempt. Save the PIN again to re-enable."
+            else -> "On: anyone with the token can unlock this phone"
+        }
+        unlockOffButton.visibility = if (UnlockSecret.isSet(this)) View.VISIBLE else View.GONE
+
         val addresses = AppSettings.localAddresses()
         endpoints.text = if (addresses.isEmpty()) "No network connection"
         else addresses.joinToString("\n") { (iface, ip) -> "${AppSettings.endpoint(ip)}  ($iface)" }
         token.text = AppSettings.token(this)
     }
+
+    private fun showSetSecretDialog() {
+        fun field(hint: String) = EditText(this).apply {
+            this.hint = hint
+            inputType = InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD
+        }
+        val first = field("Lock screen PIN or password")
+        val second = field("Repeat it")
+        val form = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+            addView(first)
+            addView(second)
+        }
+        AlertDialog.Builder(this)
+            .setTitle("Remote unlock")
+            .setMessage("Enter the PIN or password you use on the lock screen. It is stored encrypted " +
+                "on this phone and never sent anywhere, but anyone with the MCP token will be able to " +
+                "unlock the phone.")
+            .setView(form)
+            .setPositiveButton("Save") { _, _ ->
+                val secret = first.text.toString()
+                when {
+                    secret.isEmpty() -> toast("Nothing saved: the PIN was empty")
+                    secret != second.text.toString() -> toast("Nothing saved: the two entries differ")
+                    else -> {
+                        UnlockSecret.save(this, secret)
+                        toast("Saved")
+                    }
+                }
+                refresh()
+            }
+            .setNegativeButton("Cancel", null)
+            .show()
+    }
+
+    private fun toast(text: String) = Toast.makeText(this, text, Toast.LENGTH_SHORT).show()
 
     private fun copyCommand() {
         val host = AppSettings.localAddresses().firstOrNull()?.second ?: "PHONE_IP"

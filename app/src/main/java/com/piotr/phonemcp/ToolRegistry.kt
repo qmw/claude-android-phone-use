@@ -181,6 +181,14 @@ class ToolRegistry(private val device: DeviceController) {
             props(),
             emptyList(),
         ) { listOf(text(device.screenInfo())) },
+        Tool(
+            "unlock",
+            "Wake the phone and unlock it with the PIN/password the user saved in the Phone MCP app " +
+                "(it is never revealed). Makes at most one attempt; after a failed attempt remote unlock " +
+                "pauses until the user saves the PIN again.",
+            props(),
+            emptyList(),
+        ) { listOf(text(device.unlock())) },
         Tool("wake_screen", "Turn the screen on if it is off.", props(), emptyList()) {
             listOf(text(device.wakeScreen()))
         },

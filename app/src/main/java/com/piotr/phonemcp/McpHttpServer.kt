@@ -28,6 +28,13 @@ class McpHttpServer(
     private class RpcError(val code: Int, message: String) : Exception(message)
 
     override fun serve(session: IHTTPSession): Response {
+        // Always consume the body first: an unread body on a keep-alive connection would be
+        // parsed as the next request ("Syntax error. HTTP verb {...").
+        val body = try {
+            readBody(session)
+        } catch (e: Exception) {
+            return plain(Response.Status.BAD_REQUEST, e.message ?: "Bad request").apply { setKeepAlive(false) }
+        }
         val path = session.uri.trimEnd('/')
         if (path != AppSettings.MCP_PATH) {
             return plain(Response.Status.NOT_FOUND, "Not found. The MCP endpoint is ${AppSettings.MCP_PATH}")
@@ -36,7 +43,7 @@ class McpHttpServer(
             return plain(Response.Status.UNAUTHORIZED, "Missing or invalid bearer token")
         }
         return when (session.method) {
-            Method.POST -> handlePost(session)
+            Method.POST -> handlePost(body)
             // No standalone SSE stream and no sessions to terminate.
             else -> plain(Response.Status.METHOD_NOT_ALLOWED, "Only POST is supported").also {
                 it.addHeader("Allow", "POST")
@@ -51,12 +58,7 @@ class McpHttpServer(
         return MessageDigest.isEqual(presented, tokenProvider().toByteArray())
     }
 
-    private fun handlePost(session: IHTTPSession): Response {
-        val body = try {
-            readBody(session)
-        } catch (e: Exception) {
-            return plain(Response.Status.BAD_REQUEST, e.message ?: "Bad request")
-        }
+    private fun handlePost(body: String): Response {
         val parsed = try {
             JSONTokener(body).nextValue()
         } catch (e: JSONException) {
@@ -114,11 +116,11 @@ class McpHttpServer(
         return JSONObject()
             .put("protocolVersion", version)
             .put("capabilities", JSONObject().put("tools", JSONObject().put("listChanged", false)))
-            .put("serverInfo", JSONObject().put("name", "phone-mcp").put("version", "0.2.0"))
+            .put("serverInfo", JSONObject().put("name", "phone-mcp").put("version", "0.3.1"))
             .put("instructions",
                 "Controls an Android phone. Typical loop: screenshot or get_ui_tree to see the screen, " +
                     "act (tap_element / tap / type_text / scroll / press_key / launch_app), then look again " +
-                    "to verify. All coordinates are in screenshot pixels. Prefer get_ui_tree + tap_element " +
+                    "to verify. If the phone is locked, call unlock. All coordinates are in screenshot pixels. Prefer get_ui_tree + tap_element " +
                     "when elements have text or ids; use screenshots for visual content. Ask the user before " +
                     "sending messages, making purchases, or other irreversible actions.")
     }
@@ -129,18 +131,50 @@ class McpHttpServer(
         return tools.call(name, params.optJSONObject("arguments") ?: JSONObject())
     }
 
+    /** Reads a Content-Length or chunked body; requests with neither have no body. */
     private fun readBody(session: IHTTPSession): String {
-        val length = session.headers["content-length"]?.toIntOrNull()
-            ?: throw IllegalArgumentException("Content-Length required")
-        if (length > MAX_BODY) throw IllegalArgumentException("Body too large")
+        val input = session.inputStream
+        val bytes = if (session.headers["transfer-encoding"]?.contains("chunked", ignoreCase = true) == true) {
+            val out = java.io.ByteArrayOutputStream()
+            while (true) {
+                val size = readLine(input).substringBefore(';').trim().toInt(16)
+                if (size == 0) {
+                    while (readLine(input).isNotEmpty()) Unit // trailers
+                    break
+                }
+                if (out.size() + size > MAX_BODY) throw IllegalArgumentException("Body too large")
+                out.write(readExactly(input, size))
+                readLine(input) // CRLF after each chunk
+            }
+            out.toByteArray()
+        } else {
+            val length = session.headers["content-length"]?.toIntOrNull() ?: 0
+            if (length > MAX_BODY) throw IllegalArgumentException("Body too large")
+            readExactly(input, length)
+        }
+        return String(bytes, Charsets.UTF_8)
+    }
+
+    private fun readExactly(input: java.io.InputStream, length: Int): ByteArray {
         val buf = ByteArray(length)
         var read = 0
         while (read < length) {
-            val n = session.inputStream.read(buf, read, length - read)
-            if (n < 0) break
+            val n = input.read(buf, read, length - read)
+            if (n < 0) throw IllegalArgumentException("Body ended early")
             read += n
         }
-        return String(buf, 0, read, Charsets.UTF_8)
+        return buf
+    }
+
+    private fun readLine(input: java.io.InputStream): String {
+        val sb = StringBuilder()
+        while (true) {
+            val c = input.read()
+            if (c < 0) throw IllegalArgumentException("Body ended early")
+            if (c == '\n'.code) return sb.toString().trimEnd('\r')
+            if (sb.length > 1024) throw IllegalArgumentException("Bad chunk header")
+            sb.append(c.toChar())
+        }
     }
 
     private fun rpcError(id: Any, code: Int, message: String) = JSONObject()

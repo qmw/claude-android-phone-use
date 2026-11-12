@@ -482,6 +482,116 @@ class DeviceController(private val service: AccessibilityService) {
         return "Opened $uri"
     }
 
+    // ---------------------------------------------------------------- unlock
+
+    private sealed class SecretEntry {
+        class PinPad(val keys: Map<Char, AccessibilityNodeInfo>, val enter: AccessibilityNodeInfo?) : SecretEntry()
+        class PasswordField(val field: AccessibilityNodeInfo) : SecretEntry()
+    }
+
+    private fun waitFor(timeoutMs: Long, check: () -> Boolean): Boolean {
+        val deadline = System.currentTimeMillis() + timeoutMs
+        while (System.currentTimeMillis() < deadline) {
+            if (check()) return true
+            Thread.sleep(150)
+        }
+        return check()
+    }
+
+    private fun systemUiNodes(): List<AccessibilityNodeInfo> {
+        val out = mutableListOf<AccessibilityNodeInfo>()
+        fun collect(node: AccessibilityNodeInfo) {
+            out += node
+            for (i in 0 until node.childCount) node.getChild(i)?.let(::collect)
+        }
+        service.windows.mapNotNull { it.root }
+            .filter { it.packageName == "com.android.systemui" }
+            .forEach(::collect)
+        return out
+    }
+
+    /** Finds the lock screen's PIN pad (AOSP view ids key0..key9) or its password field. */
+    private fun findSecretEntry(): SecretEntry? {
+        val nodes = systemUiNodes()
+        nodes.firstOrNull { it.isEditable && it.viewIdResourceName?.endsWith(":id/passwordEntry") == true }
+            ?.let { return SecretEntry.PasswordField(it) }
+        val keys = mutableMapOf<Char, AccessibilityNodeInfo>()
+        var enter: AccessibilityNodeInfo? = null
+        for (node in nodes) {
+            val id = node.viewIdResourceName?.substringAfter(":id/") ?: continue
+            if (id == "key_enter") enter = node
+            if (id.length == 4 && id.startsWith("key") && id[3].isDigit()) keys[id[3]] = node
+        }
+        return if (keys.size == 10) SecretEntry.PinPad(keys, enter) else null
+    }
+
+    private fun press(node: AccessibilityNodeInfo) {
+        if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) return
+        val rect = Rect().also { node.getBoundsInScreen(it) }
+        val s = scale()
+        tap(rect.centerX() * s, rect.centerY() * s)
+    }
+
+    fun unlock(): String {
+        val keyguard = service.getSystemService(KeyguardManager::class.java)
+        if (!keyguard.isKeyguardLocked) return "The phone is already unlocked"
+        val secret = if (keyguard.isDeviceSecure) {
+            if (UnlockSecret.isPaused(service)) throw ToolException(
+                "Remote unlock is paused after a failed attempt. Ask the user to unlock the phone and " +
+                    "save the PIN again in the Phone MCP app.")
+            UnlockSecret.load(service) ?: throw ToolException(
+                "Remote unlock is not set up. Ask the user to unlock the phone themselves, or to save " +
+                    "their PIN in the Phone MCP app (\"Set unlock PIN or password\").")
+        } else null
+
+        service.startActivity(Intent(service, UnlockActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_ANIMATION))
+        if (secret == null) {
+            // No PIN set (swipe-only lock): dismissing the keyguard is enough.
+            if (waitFor(4000) { !keyguard.isKeyguardLocked }) return "Unlocked"
+            throw ToolException("The lock screen did not go away")
+        }
+
+        var entry: SecretEntry? = null
+        if (!waitFor(4000) { findSecretEntry().also { entry = it } != null }) {
+            // Some lock screens need a swipe up before they show the PIN pad.
+            val size = modelSize()
+            swipe(size.x / 2.0, size.y * 0.85, size.x / 2.0, size.y * 0.3, 250)
+            waitFor(3000) { findSecretEntry().also { entry = it } != null }
+        }
+        when (val found = entry) {
+            null -> throw ToolException(
+                "Couldn't find the PIN pad or password field on the lock screen, so nothing was entered. " +
+                    "Pattern locks aren't supported.")
+            is SecretEntry.PinPad -> {
+                if (!secret.all { it.isDigit() }) throw ToolException(
+                    "The lock screen asks for a PIN but the saved secret isn't numeric; nothing was entered.")
+                for (digit in secret) {
+                    press(found.keys.getValue(digit))
+                    Thread.sleep(90)
+                }
+                // With auto-confirm the phone may already be unlocked.
+                if (keyguard.isKeyguardLocked) found.enter?.let { if (it.refresh()) press(it) }
+            }
+            is SecretEntry.PasswordField -> {
+                val args = Bundle().apply {
+                    putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, secret)
+                }
+                if (!found.field.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) {
+                    throw ToolException("The password field refused input; nothing was submitted.")
+                }
+                found.field.performAction(AccessibilityNodeInfo.AccessibilityAction.ACTION_IME_ENTER.id)
+            }
+        }
+
+        if (waitFor(4000) { !keyguard.isKeyguardLocked }) return "Unlocked"
+        UnlockSecret.pause(service)
+        throw ToolException(
+            "The PIN was entered but the phone is still locked (wrong saved PIN, or the lock screen " +
+                "rejected it). Remote unlock is now paused to avoid lockouts; the user must unlock the " +
+                "phone and save the PIN again in the Phone MCP app.")
+    }
+
     // ---------------------------------------------------------------- notifications
 
     fun notifications(appFilter: String?, includeOngoing: Boolean): String {
